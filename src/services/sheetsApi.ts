@@ -1,5 +1,7 @@
+import firebaseConfig from '../../firebase-applet-config.json';
 import {
   ALL_SHEET_TABS,
+  headerMatchesTab,
   parseTabsToPlanner,
   serializePlannerToTabs,
   SHEET_HEADERS,
@@ -281,35 +283,178 @@ export interface PublicSheetLoadResult {
   state: PlannerState;
 }
 
+interface GoogleApiErrorBody {
+  error?: {
+    message?: string;
+    status?: string;
+    details?: Array<{ reason?: string }>;
+  };
+}
+
+function getPublicSheetsApiKey(): string {
+  const envKey = (
+    import.meta.env.VITE_GOOGLE_SHEETS_API_KEY as string | undefined
+  )?.trim();
+  return envKey || firebaseConfig.apiKey || '';
+}
+
+async function publicSheetsFetch<T>(url: string): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(url, { method: 'GET' });
+  } catch {
+    throw new SheetsApiError(
+      'Unable to reach Google Sheets right now. Please try again shortly.',
+      500,
+      'FETCH_ERROR'
+    );
+  }
+
+  if (!res.ok) {
+    let errBody: GoogleApiErrorBody | null = null;
+    try {
+      errBody = (await res.json()) as GoogleApiErrorBody;
+    } catch {
+      // ignore json parse failure
+    }
+
+    const message = errBody?.error?.message || '';
+    const reasons = (errBody?.error?.details ?? [])
+      .map((d) => d.reason || '')
+      .filter(Boolean);
+
+    if (res.status === 401 || res.status === 403) {
+      const isKeyOrConfigError =
+        reasons.some(
+          (r) =>
+            r === 'API_KEY_INVALID' ||
+            r === 'API_KEY_HTTP_REFERRER_BLOCKED' ||
+            r === 'SERVICE_DISABLED'
+        ) ||
+        /api key|referer|referrer|has not been used|is disabled/i.test(message);
+
+      if (isKeyOrConfigError) {
+        throw new SheetsApiError(
+          `Google Sheets API access blocked (${
+            message || 'API key or project restriction'
+          }). Ensure the Google Sheets API is enabled and this domain is allowed on the browser API key.`,
+          403,
+          'API_KEY_OR_CONFIG_ERROR'
+        );
+      }
+
+      throw new SheetsApiError(
+        'This Google Spreadsheet is private. Ask the organizer to set Drive sharing to "Anyone with the link" (Viewer) for login-free access.',
+        403,
+        'PRIVATE_OR_RESTRICTED'
+      );
+    }
+
+    if (res.status === 404) {
+      throw new SheetsApiError(
+        'Spreadsheet not found. Check that the link is valid.',
+        404,
+        'NOT_FOUND'
+      );
+    }
+
+    throw new SheetsApiError(
+      message || 'Unable to reach Google Sheets right now. Please try again shortly.',
+      res.status,
+      'FETCH_ERROR'
+    );
+  }
+
+  return (await res.json()) as T;
+}
+
 export async function loadPublicReadOnlyPlanner(
   spreadsheetId: string
 ): Promise<PublicSheetLoadResult> {
-  const res = await fetch(
-    `/api/public-sheet/${encodeURIComponent(spreadsheetId)}`
+  const safeId = spreadsheetId.trim();
+  if (!/^[a-zA-Z0-9-_]{15,120}$/.test(safeId)) {
+    throw new SheetsApiError('Invalid Google Spreadsheet ID.', 400, 'INVALID_ID');
+  }
+
+  const apiKey = getPublicSheetsApiKey();
+  if (!apiKey) {
+    throw new SheetsApiError(
+      'Missing Google API key for read-only Sheets access.',
+      500,
+      'MISSING_API_KEY'
+    );
+  }
+
+  const meta = await publicSheetsFetch<{
+    spreadsheetId: string;
+    properties?: { title?: string };
+    sheets?: Array<{ properties?: { title?: string } }>;
+  }>(
+    `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(
+      safeId
+    )}?fields=spreadsheetId,properties.title,sheets.properties.title&key=${encodeURIComponent(
+      apiKey
+    )}`
   );
 
-  const payload = (await res.json()) as {
-    error?: string;
-    code?: string;
-    tabs?: Partial<Record<SheetTabName, unknown[][]>>;
-    title?: string;
-  };
+  const existingSheetTitles = new Set(
+    (meta.sheets ?? [])
+      .map((s) => s.properties?.title)
+      .filter((t): t is string => Boolean(t))
+  );
 
-  if (!res.ok) {
+  const tabsToFetch = ALL_SHEET_TABS.filter((tab) =>
+    existingSheetTitles.has(tab)
+  );
+
+  if (tabsToFetch.length === 0) {
     throw new SheetsApiError(
-      payload.error || 'Could not load public spreadsheet.',
-      res.status,
-      payload.code
+      'This public spreadsheet does not contain Hearth & Bunk planning tabs yet. The organizer needs to save their plan to this sheet first.',
+      422,
+      'UNRECOGNIZED_FORMAT'
+    );
+  }
+
+  const rangesQuery = tabsToFetch
+    .map((tab) => `ranges=${encodeURIComponent(`${tab}!A1:Z2000`)}`)
+    .join('&');
+
+  const batchData = await publicSheetsFetch<{
+    valueRanges?: Array<{ range: string; values?: unknown[][] }>;
+  }>(
+    `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(
+      safeId
+    )}/values:batchGet?${rangesQuery}&key=${encodeURIComponent(apiKey)}`
+  );
+
+  const tabValues: Partial<Record<SheetTabName, unknown[][]>> = {};
+  let matchedCount = 0;
+
+  (batchData.valueRanges ?? []).forEach((vr, index) => {
+    const tabName = tabsToFetch[index];
+    if (!tabName) return;
+    const rows = vr.values ?? [];
+    if (rows.length > 0 && headerMatchesTab(rows[0], tabName)) {
+      tabValues[tabName] = rows;
+      matchedCount += 1;
+    }
+  });
+
+  if (matchedCount === 0) {
+    throw new SheetsApiError(
+      'This public spreadsheet does not contain Hearth & Bunk planning tabs yet. The organizer needs to save their plan to this sheet first.',
+      422,
+      'UNRECOGNIZED_FORMAT'
     );
   }
 
   const state = parseTabsToPlanner(
-    payload.tabs ?? {},
-    payload.title || 'Shared Event Plan'
+    tabValues,
+    meta.properties?.title || 'Shared Family Event'
   );
 
   return {
-    spreadsheetId,
+    spreadsheetId: safeId,
     state,
   };
 }
