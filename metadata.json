@@ -1,0 +1,6 @@
+{
+  "name": "Hearth & Bunk",
+  "description": "Family event sleeping arrangement planner backed by Google Sheets, with shared and individual bed mapping, drag-and-drop room assignment, bed source math, family summaries, and login-free read-only sharing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
